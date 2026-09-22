@@ -1,9 +1,13 @@
+import logging
+
 from dotenv import load_dotenv
 # 環境変数の読み込み
 # .envファイルがカレントディレクトリにあれば、それを読み込む
 load_dotenv()
 
-from typesafe_sdk import TypeSafeClient, Choice, Noul
+from typesafe_sdk import TypeSafeClient, Choice, Noul, Score, RetryPolicy
+
+logger = logging.getLogger(__name__)
 
 def call_llm_fallback(message_text: str, channel_type: str) -> dict:
     """
@@ -30,37 +34,67 @@ def check_slack_message(message_text: str, channel_type: str = "public", debug: 
     }
     
     # 2. Jevクライアントで判定リクエストを実行
-    with TypeSafeClient() as client:
-        response = client.system_one(
-            state=state,
-            questions={
-                # 違反カテゴリの判定（Choice）
-                "violation_type": Choice(
-                    instructions="メッセージがどの規約違反に該当するか選択してください",
-                    criteria={
-                        "safe": "問題なし・健全な発言",
-                        "confidential_leak": "パスワードや秘密情報、NDA該当情報の漏洩",
-                        "harassment": "攻撃的・侮蔑的な発言",
-                        "spam": "不適切な連投や無関係な宣伝"
-                    }
-                ),
-                # 即時対応が必要かどうかの判定（Noul: Boolean確率）
-                "needs_immediate_action": Noul(
-                    instructions="情報漏洩や深刻なハラスメントなど、直ちに非表示化が必要か"
+    try:
+        with TypeSafeClient() as client:
+            response = client.system_one(
+                state=state,
+                questions={
+                    # 違反カテゴリの判定（Choice）
+                    "violation_type": Choice(
+                        instructions="メッセージがどの規約違反に該当するか選択してください",
+                        criteria={
+                            "safe": "問題なし・健全な発言",
+                            "confidential_leak": "パスワードや秘密情報、NDA該当情報の漏洩",
+                            "harassment": "攻撃的・侮蔑的な発言",
+                            "spam": "不適切な連投や無関係な宣伝"
+                        }
+                    ),
+                    # 即時対応が必要かどうかの判定（Noul: Boolean確率）
+                    "needs_immediate_action": Noul(
+                        instructions="情報漏洩や深刻なハラスメントなど、直ちに非表示化が必要か"
+                    ),
+                    # リスクの緊急度スコア (Score)
+                    "urgency_score": Score(
+                        instructions="このメッセージの不適切さおよび対応の緊急度を 0.0 から 1.0 の範囲で算出してください",
+                        criteria = [
+                            "0.0: 問題なし・健全な発言",
+                            "0.5: グレーゾーン。注意を要する遠回しな表現や不適切な言及",
+                            "1.0: 極めて不適切・緊急。重大な情報漏洩や深刻なハラスメント"
+                        ]
+                    )
+                },
+                # リトライ設定
+                # 最大3回、10秒タイムアウト、
+                # 429(Too Many Requests)と5xx系(サーバーエラー)
+                # の場合にリトライする
+                retry=RetryPolicy(
+                    max_retries=3,
+                    timeout=10.0,
+                    http_statuses={429, 500, 502, 503, 504}
                 )
-            }
-        )
-        
-    result = {
-        "category": response.answers["violation_type"].choice,
-        "confidence": response.answers["violation_type"].confidence,
-        "needs_action": response.answers["needs_immediate_action"].noul,
-    }
-    if debug:
-        result["message_text"] = message_text
-        result["channel_type"] = channel_type
+            )
+            
+        result = {
+            "category": response.answers["violation_type"].choice,
+            "confidence": response.answers["violation_type"].confidence,
+            "needs_immediate_action": response.answers["needs_immediate_action"].noul,
+            "urgency_score": response.answers["urgency_score"].score,
+            "error": None,
+        }
+        if debug:
+            result["message_text"] = message_text
+            result["channel_type"] = channel_type
 
-    return result
+        return result
+    except Exception as e:
+        logger.exception("Jevの呼び出しに失敗しました")
+        return {
+            "category": "unknown",
+            "confidence": 0.0,
+            "needs_action": False,
+            "urgency_score": 0.0,
+            "error": str(e)
+        }
 
 def check_slack_message_with_fallback(message_text: str, channel_type: str = "public", confidence_threshold: float = 0.75, debug: bool = False) -> dict:
     """
